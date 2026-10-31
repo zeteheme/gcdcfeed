@@ -15,7 +15,8 @@ from html.parser import HTMLParser
 from pathlib import Path
 from xml.sax.saxutils import escape
 
-API_URL = "https://pim.playkog.com/api/website/board/gcm/NEW/en?pageIndex=1&rows=10"
+API_URL_TEMPLATE = "https://pim.playkog.com/api/website/board/gcm/{category}/en?pageIndex=1&rows=10"
+CATEGORIES = ("NEW", "NOTICE", "UPDATE", "EVENT")
 DETAIL_URL = "https://pim.playkog.com/api/website/board/detail/{uid}"
 SITE_URL = "https://grandchase.net/?category=NEW&page=1&lang=en"
 POST_URL = SITE_URL  # Replace if you later identify a direct announcement page URL.
@@ -371,11 +372,26 @@ def main():
     old_guids = existing_guids(output)
 
     if args.input:
+        # A saved API response is still supported for offline/testing use.
         data = json.loads(Path(args.input).read_text(encoding="utf-8"))
+        items = collect_items(data)
     else:
-        data = fetch_json(API_URL)
-
-    items = collect_items(data)
+        # Fetch each news category separately, then merge and deduplicate posts.
+        combined_posts = []
+        seen_uids = set()
+        for category in CATEGORIES:
+            category_url = API_URL_TEMPLATE.format(category=category)
+            try:
+                category_data = fetch_json(category_url)
+            except Exception as exc:
+                print(f"Warning: failed to fetch {category} category: {exc}", file=sys.stderr)
+                continue
+            for post in category_data.get("datalist") or []:
+                uid = post.get("boardUID")
+                if uid is not None and uid not in seen_uids:
+                    seen_uids.add(uid)
+                    combined_posts.append(post)
+        items = collect_items({"datalist": combined_posts})
     if not items:
         sys.exit("The API returned no posts, so nothing was written.")
 
