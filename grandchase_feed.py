@@ -24,7 +24,7 @@ INCLUDE_PINNED = True
 FEED_TITLE = "GrandChase News (unofficial)"
 FEED_DESCRIPTION = "New posts from the GrandChase news page: notices, events and updates."
 CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
-DISCORD_LIMIT = 2000
+DISCORD_EMBED_DESCRIPTION_LIMIT = 3900  # Leave room below Discord's 4,096-character embed limit.
 MEDIA_NS = "http://search.yahoo.com/mrss/"
 
 
@@ -34,21 +34,47 @@ def xml_text(value):
 
 
 class AnnouncementHTMLParser(HTMLParser):
-    """Collect image URLs and create a plain-text fallback from announcement HTML."""
-    BLOCKS = {"p", "div", "br", "li", "tr", "table", "figure", "h1", "h2", "h3", "h4", "section"}
+    """Collect image URLs and turn announcement HTML into readable plain text."""
+    BLOCKS = {"p", "div", "br", "li", "figure", "h1", "h2", "h3", "h4", "section"}
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.parts = []
         self.images = []
+        self.in_table = False
+        self.table_rows = []
+        self.current_row = None
+        self.current_cell = None
+        self.current_cell_tag = None
 
     def handle_starttag(self, tag, attrs):
         tag = tag.lower()
         attrs = dict(attrs)
+        if tag == "table":
+            self.in_table = True
+            self.table_rows = []
+            self.current_row = None
+            self.current_cell = None
+            self.parts.append("\n")
+            return
+
+        if self.in_table:
+            if tag == "tr":
+                self.current_row = []
+            elif tag in {"td", "th"} and self.current_row is not None:
+                self.current_cell = []
+                self.current_cell_tag = tag
+            elif tag == "img":
+                src = (attrs.get("src") or "").strip()
+                if src.startswith(("https://", "http://")) and src not in self.images:
+                    self.images.append(src)
+                alt = (attrs.get("alt") or "").strip()
+                if alt and self.current_cell is not None:
+                    self.current_cell.append(alt)
+            return
+
         if tag in self.BLOCKS:
             self.parts.append("\n")
-        if tag in {"td", "th"}:
-            self.parts.append(" | ")
         if tag == "img":
             src = (attrs.get("src") or "").strip()
             if src.startswith(("https://", "http://")) and src not in self.images:
@@ -59,13 +85,63 @@ class AnnouncementHTMLParser(HTMLParser):
 
     def handle_endtag(self, tag):
         tag = tag.lower()
+        if self.in_table:
+            if tag in {"td", "th"} and self.current_cell is not None:
+                cell = re.sub(r"\s+", " ", "".join(self.current_cell)).strip()
+                self.current_row.append((self.current_cell_tag, cell))
+                self.current_cell = None
+                self.current_cell_tag = None
+            elif tag == "tr" and self.current_row is not None:
+                if self.current_row:
+                    self.table_rows.append(self.current_row)
+                self.current_row = None
+            elif tag == "table":
+                self.parts.append(self._format_table(self.table_rows))
+                self.parts.append("\n")
+                self.in_table = False
+                self.table_rows = []
+            return
+
         if tag in self.BLOCKS:
             self.parts.append("\n")
-        if tag in {"td", "th"}:
-            self.parts.append(" | ")
 
     def handle_data(self, data):
-        self.parts.append(data)
+        if self.in_table and self.current_cell is not None:
+            self.current_cell.append(data)
+        else:
+            self.parts.append(data)
+
+    @staticmethod
+    def _format_table(rows):
+        """Render HTML tables as labeled rows; Discord does not support Markdown tables."""
+        rows = [[(kind, value) for kind, value in row] for row in rows if row]
+        if not rows:
+            return ""
+
+        first_row = rows[0]
+        has_header_cells = any(kind == "th" for kind, _ in first_row)
+        # Some announcement tables use TD for their header row; treat the first
+        # row as headings when it has multiple cells and later rows are present.
+        use_first_as_header = has_header_cells or (len(rows) > 1 and len(first_row) > 1)
+        if use_first_as_header:
+            headers = [value or f"Column {i + 1}" for i, (_, value) in enumerate(first_row)]
+            data_rows = rows[1:]
+        else:
+            headers = [f"Column {i + 1}" for i in range(max(len(row) for row in rows))]
+            data_rows = rows
+
+        rendered = ["**Table**"]
+        for row_number, row in enumerate(data_rows, start=1):
+            values = [value for _, value in row]
+            fields = []
+            for index, value in enumerate(values):
+                if not value:
+                    continue
+                label = headers[index] if index < len(headers) else f"Column {index + 1}"
+                fields.append(f"**{label}:** {value}")
+            if fields:
+                rendered.append("• " + "  |  ".join(fields))
+        return "\n".join(rendered)
 
     def plain_text(self):
         value = html.unescape("".join(self.parts)).replace("\xa0", " ")
@@ -206,27 +282,61 @@ def discord_send(webhook_url, payload):
             raise RuntimeError(f"Discord returned HTTP {response.status}")
 
 
-def discord_payload(item):
-    title = item["title"][:256]
-    description = item["description_text"] or "(Announcement text unavailable.)"
-    if len(description) > 4096:
-        description = description[:4095].rstrip() + "…"
+def split_discord_text(text, limit=DISCORD_EMBED_DESCRIPTION_LIMIT):
+    """Split text without dropping content, preferring paragraph/sentence boundaries."""
+    text = (text or "").strip() or "(Announcement text unavailable.)"
+    chunks = []
+    while len(text) > limit:
+        window = text[:limit]
+        # Prefer a paragraph or line break, then a sentence boundary, then a word.
+        cut = window.rfind("\n\n")
+        if cut < limit // 2:
+            cut = window.rfind("\n")
+        if cut < limit // 2:
+            sentence_matches = list(re.finditer(r"[.!?](?:[\"'”’)]*)\s+", window))
+            cut = sentence_matches[-1].end() if sentence_matches else -1
+        if cut < limit // 2:
+            cut = window.rfind(" ")
+        if cut <= 0:
+            cut = limit
+        chunk = text[:cut].strip()
+        if chunk:
+            chunks.append(chunk)
+        text = text[cut:].lstrip()
+    if text:
+        chunks.append(text)
+    return chunks
 
-    embed = {
-        "title": title,
-        "url": POST_URL.format(uid=item["uid"]),
-        "description": description,
-    }
-    if item["category"]:
-        embed["footer"] = {"text": f"GrandChase • {item['category']}"}
 
-    # Discord embeds can show up to four images in one message. Additional
-    # images remain available in the RSS item's original HTML description.
-    embeds = [embed]
-    for image_url in item["images"][:3]:
-        embeds.append({"url": POST_URL.format(uid=item["uid"]), "image": {"url": image_url}})
+def discord_payloads(item):
+    """Create one webhook payload per chunk; attach announcement images to the first."""
+    description = item.get("description_text") or "(Announcement text unavailable.)"
+    chunks = split_discord_text(description)
+    total = len(chunks)
+    url = POST_URL.format(uid=item["uid"])
+    payloads = []
 
-    return {"embeds": embeds}
+    for index, chunk in enumerate(chunks, start=1):
+        title = item["title"][:256]
+        if total > 1:
+            suffix = f" (Part {index}/{total})"
+            title = title[:256 - len(suffix)] + suffix
+        embed = {"title": title, "url": url, "description": chunk}
+        if item.get("category"):
+            footer = f"GrandChase • {item['category']}"
+            if total > 1:
+                footer += f" • Part {index}/{total}"
+            embed["footer"] = {"text": footer[:2048]}
+        embeds = [embed]
+
+        # Discord allows up to 10 embeds per message. Keep the first message
+        # compact and attach up to three announcement images alongside its text.
+        if index == 1:
+            for image_url in item.get("images", [])[:3]:
+                embeds.append({"url": url, "image": {"url": image_url}})
+        payloads.append({"embeds": embeds})
+
+    return payloads
 
 
 def notify_discord(items, old_guids, webhook_url):
@@ -239,9 +349,14 @@ def notify_discord(items, old_guids, webhook_url):
     new_items = [item for item in items if f"gcm-{item['uid']}" not in old_guids]
     for item in reversed(new_items):
         try:
-            discord_send(webhook_url, discord_payload(item))
-            print(f"Sent Discord notification for {item['uid']}")
-            time.sleep(1)
+            payloads = discord_payloads(item)
+            for part_number, payload in enumerate(payloads, start=1):
+                discord_send(webhook_url, payload)
+                if len(payloads) > 1:
+                    print(f"Sent Discord notification for {item['uid']} (part {part_number}/{len(payloads)})")
+                time.sleep(1)
+            if len(payloads) == 1:
+                print(f"Sent Discord notification for {item['uid']}")
         except Exception as exc:
             print(f"Warning: Discord notification failed for {item['uid']}: {exc}", file=sys.stderr)
 
