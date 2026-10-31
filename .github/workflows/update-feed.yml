@@ -3,8 +3,14 @@ name: Update GrandChase feed
 
 on:
   schedule:
-    - cron: "0 */12 * * *" # Every 12 hours (UTC)
+    - cron: "0 */12 * * *"
   workflow_dispatch:
+    inputs:
+      test_discord:
+        description: "Send a test message to Discord"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -16,19 +22,41 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v6
+
+      - name: Test Discord webhook
+        if: github.event_name == 'workflow_dispatch' && inputs.test_discord
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            echo "Discord webhook secret is missing."
+            exit 1
+          fi
+
+          curl --fail-with-body --silent --show-error \
+            -H "Content-Type: application/json" \
+            -X POST \
+            -d '{"content":"GrandChase RSS webhook test successful!"}' \
+            "$DISCORD_WEBHOOK_URL"
+
+          echo "Discord webhook test succeeded."
 
       - name: Restore previous RSS feed
         run: |
           mkdir -p site
-          curl --fail --silent --show-error --location \
+
+          if curl --fail --silent --show-error --location \
             --retry 3 \
             "https://zeteheme.github.io/gcdcfeed/feed.xml" \
-            --output site/feed.xml || {
-              echo "No previous feed found. Skipping first-run backlog."
-              rm -f site/feed.xml
-            }
+            --output site/feed.xml; then
+            echo "Previous RSS feed restored."
+          else
+            echo "No previous feed available. Starting baseline."
+            rm -f site/feed.xml
+          fi
 
       - name: Build feed and notify Discord
         env:
@@ -42,12 +70,15 @@ jobs:
   deploy:
     needs: build
     runs-on: ubuntu-latest
+
     permissions:
       pages: write
       id-token: write
+
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
+
     steps:
       - id: deployment
         uses: actions/deploy-pages@v5
