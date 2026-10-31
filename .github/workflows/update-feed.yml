@@ -1,9 +1,10 @@
+
 name: Update GrandChase feed
 
 on:
   schedule:
-    - cron: "0 */12 * * *" # every hour, 17 minutes past (times are UTC)
-  workflow_dispatch: # adds a "Run workflow" button on the Actions tab
+    - cron: "0 */12 * * *" # Every 12 hours (UTC)
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -18,7 +19,20 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Build feed
+      - name: Restore previous RSS feed
+        run: |
+          mkdir -p site
+          curl --fail --silent --show-error --location \
+            --retry 3 \
+            "https://zeteheme.github.io/gcdcfeed/feed.xml" \
+            --output site/feed.xml || {
+              echo "No previous feed found. Skipping first-run backlog."
+              rm -f site/feed.xml
+            }
+
+      - name: Build feed and notify Discord
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: python3 grandchase_feed.py --output site/feed.xml
 
       - uses: actions/upload-pages-artifact@v5
@@ -37,4 +51,3 @@ jobs:
     steps:
       - id: deployment
         uses: actions/deploy-pages@v5
-
