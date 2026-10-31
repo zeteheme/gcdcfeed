@@ -1,1 +1,40 @@
+name: Update GrandChase feed
+
+on:
+  schedule:
+    - cron: "17 * * * *" # every hour, 17 minutes past (times are UTC)
+  workflow_dispatch: # adds a "Run workflow" button on the Actions tab
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build feed
+        run: python3 grandchase_feed.py --output site/feed.xml
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
 
