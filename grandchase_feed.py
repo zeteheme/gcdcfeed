@@ -1,50 +1,167 @@
 
 #!/usr/bin/env python3
 
-"""Build the GrandChase RSS feed and notify Discord of new posts."""
+"""Build a multi-category GrandChase RSS feed and notify Discord."""
 
 import argparse
+import html
 import json
 import os
 import re
 import sys
 import time
-import urllib.request
 import urllib.error
+import urllib.parse
+import urllib.request
 import xml.etree.ElementTree as ET
 
 from datetime import datetime, timezone
 from email.utils import format_datetime
+from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import urljoin
 from xml.sax.saxutils import escape
 
-API_URL = (
-    "https://pim.playkog.com/api/website/board/gcm/NEW/en"
-    "?pageIndex=1&rows=10"
+
+# --------------------------------------------------
+# CONFIGURATION
+# --------------------------------------------------
+
+BASE_API = (
+    "https://pim.playkog.com/api/website/board/gcm/{category}/en"
 )
 
-SITE_URL = "https://grandchase.net/?category=NEW&page=1&lang=en"
-POST_URL = SITE_URL
-SOURCE_TZ = timezone.utc
+DETAIL_API = (
+    "https://pim.playkog.com/api/website/board/detail/{uid}"
+)
+
+CATEGORIES = ("NEW", "NOTICE", "UPDATE", "EVENT")
+
+ROWS_PER_CATEGORY = 100
+
 INCLUDE_PINNED = True
 
+SITE_URL = "https://grandchase.net/"
+
+CATEGORY_URL = (
+    "https://grandchase.net/?category={category}&page=1&lang=en"
+)
+
 FEED_TITLE = "GrandChase News (unofficial)"
+
 FEED_DESCRIPTION = (
-    "New posts from the GrandChase news page: notices, events and updates."
+    "Unofficial GrandChase news feed containing notices, "
+    "events, and updates."
+)
+
+USER_AGENT = (
+    "grandchase-rss/2.0 "
+    "(https://github.com/zeteheme/gcdcfeed)"
 )
 
 CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+WHITESPACE = re.compile(r"\s+")
 
 
-def text(value):
-    return escape(CONTROL_CHARS.sub("", str(value)))
+# --------------------------------------------------
+# HTML CONTENT EXTRACTION
+# --------------------------------------------------
 
+class ContentParser(HTMLParser):
+    """Extract readable text and image URLs from HTML."""
+
+    BLOCK_TAGS = {
+        "p", "div", "br", "li", "tr", "td", "th",
+        "h1", "h2", "h3", "h4", "h5", "h6",
+        "section", "article", "blockquote"
+    }
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+
+        self.parts = []
+        self.images = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+
+        if tag.lower() == "img":
+            src = (
+                attrs.get("src")
+                or attrs.get("data-src")
+                or attrs.get("data-original")
+            )
+
+            if src:
+                self.images.append(src.strip())
+
+        if tag.lower() in self.BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag.lower() in self.BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if data:
+            self.parts.append(data)
+
+    def plain_text(self):
+        value = html.unescape("".join(self.parts))
+
+        lines = [
+            WHITESPACE.sub(" ", line).strip()
+            for line in value.splitlines()
+        ]
+
+        return "\n".join(
+            line for line in lines if line
+        )
+
+
+# --------------------------------------------------
+# GENERAL HELPERS
+# --------------------------------------------------
+
+def clean_text(value):
+    value = CONTROL_CHARS.sub("", str(value or ""))
+    return value.strip()
+
+
+def xml_safe(value):
+    return escape(
+        CONTROL_CHARS.sub("", str(value or ""))
+    )
+
+
+def parse_time(value):
+    if not value:
+        return datetime.now(timezone.utc)
+
+    try:
+        parsed = datetime.fromisoformat(
+            str(value).strip().replace("Z", "+00:00")
+        )
+
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+
+        return parsed.astimezone(timezone.utc)
+
+    except (TypeError, ValueError):
+        return datetime.now(timezone.utc)
+
+
+# --------------------------------------------------
+# API REQUESTS
+# --------------------------------------------------
 
 def fetch_json(url, attempts=3):
+
     request = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "grandchase-rss/1.0",
+            "User-Agent": USER_AGENT,
             "Accept": "application/json",
         },
     )
@@ -52,228 +169,698 @@ def fetch_json(url, attempts=3):
     last_error = None
 
     for attempt in range(1, attempts + 1):
+
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                return json.load(response)
+            with urllib.request.urlopen(
+                request,
+                timeout=30
+            ) as response:
+
+                return json.loads(
+                    response.read().decode("utf-8-sig")
+                )
+
         except Exception as exc:
+
             last_error = exc
+
             if attempt < attempts:
-                time.sleep(5 * attempt)
+                time.sleep(3 * attempt)
 
-    sys.exit(f"Could not fetch GrandChase API: {last_error}")
-
-
-def parse_time(value):
-    return datetime.fromisoformat(value).replace(tzinfo=SOURCE_TZ)
+    raise RuntimeError(
+        f"Could not fetch API: {url}\n{last_error}"
+    )
 
 
-def collect_items(data):
+# --------------------------------------------------
+# COLLECT ANNOUNCEMENTS
+# --------------------------------------------------
+
+def collect_category(data, category):
+
     items = []
 
     for post in data.get("datalist") or []:
+
+        if not isinstance(post, dict):
+            continue
+
         if not post.get("isUse", True):
             continue
 
-        pinned = bool(post.get("topFixIsUse"))
-
-        if pinned and not INCLUDE_PINNED:
+        if (
+            post.get("topFixIsUse")
+            and not INCLUDE_PINNED
+        ):
             continue
 
-        uid = str(post["boardUID"])
+        uid = str(
+            post.get("boardUID") or ""
+        ).strip()
+
+        if not uid:
+            continue
 
         items.append({
+
             "uid": uid,
+
             "title": (
-                (post.get("subject") or "").strip()
+                clean_text(post.get("subject"))
                 or f"Post {uid}"
             ),
-            "category": post.get("categoryName") or "",
+
+            "category": (
+                clean_text(post.get("categoryName"))
+                or category
+            ),
+
+            "categories": [category],
+
             "published": parse_time(
                 post.get("displayStartDate")
-                or post["lastUpdateDate"]
+                or post.get("lastUpdateDate")
             ),
+
+            "description_text": "",
+
+            "images": [],
+
         })
 
+    return items
+
+
+def collect_all_categories():
+
+    by_uid = {}
+
+    for category in CATEGORIES:
+
+        url = (
+            BASE_API.format(category=category)
+            + f"?pageIndex=1&rows={ROWS_PER_CATEGORY}"
+        )
+
+        print(
+            f"Fetching {category} announcements..."
+        )
+
+        data = fetch_json(url)
+
+        category_posts = collect_category(
+            data,
+            category
+        )
+
+        for item in category_posts:
+
+            uid = item["uid"]
+
+            if uid in by_uid:
+
+                if category not in by_uid[uid]["categories"]:
+                    by_uid[uid]["categories"].append(category)
+
+                continue
+
+            by_uid[uid] = item
+
+    items = list(by_uid.values())
+
     items.sort(
-        key=lambda item: (item["published"], item["uid"]),
+        key=lambda item: (
+            item["published"],
+            item["uid"]
+        ),
         reverse=True,
     )
 
     return items
 
 
+# --------------------------------------------------
+# ANNOUNCEMENT DETAIL EXTRACTION
+# --------------------------------------------------
+
+def first_value(data, keys):
+
+    if not isinstance(data, dict):
+        return None
+
+    for key in keys:
+
+        value = data.get(key)
+
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    return None
+
+
+def find_detail_fields(data):
+
+    html_keys = (
+        "detailHTML",
+        "contentsHTML",
+        "contentHTML",
+        "boardHTML",
+        "html",
+        "contentHtml",
+        "contentsHtml",
+    )
+
+    text_keys = (
+        "detailTEXT",
+        "contentsTEXT",
+        "contentTEXT",
+        "boardTEXT",
+        "content",
+        "contents",
+        "detailText",
+        "contentText",
+        "description",
+    )
+
+    queue = [data]
+
+    while queue:
+
+        current = queue.pop(0)
+
+        if isinstance(current, dict):
+
+            html_value = first_value(
+                current,
+                html_keys
+            )
+
+            text_value = first_value(
+                current,
+                text_keys
+            )
+
+            if html_value or text_value:
+                return (
+                    html_value or "",
+                    text_value or ""
+                )
+
+            queue.extend(
+                value
+                for value in current.values()
+                if isinstance(value, (dict, list))
+            )
+
+        elif isinstance(current, list):
+
+            queue.extend(
+                value
+                for value in current
+                if isinstance(value, (dict, list))
+            )
+
+    return "", ""
+
+
+def get_detail(uid):
+
+    url = DETAIL_API.format(
+        uid=urllib.parse.quote(str(uid), safe="")
+    )
+
+    try:
+
+        data = fetch_json(url)
+
+    except Exception as exc:
+
+        print(
+            f"WARNING: Detail fetch failed for {uid}: {exc}",
+            file=sys.stderr
+        )
+
+        return "", []
+
+    raw_html, raw_text = find_detail_fields(data)
+
+    parser = ContentParser()
+
+    if raw_html:
+
+        try:
+            parser.feed(raw_html)
+            parser.close()
+
+        except Exception as exc:
+
+            print(
+                f"WARNING: HTML parsing failed for {uid}: {exc}",
+                file=sys.stderr
+            )
+
+    body = (
+        parser.plain_text()
+        or clean_text(raw_text)
+    )
+
+    images = list(dict.fromkeys(
+        urljoin(
+            "https://grandchase.net/",
+            image_url
+        )
+        for image_url in parser.images
+    ))
+
+    if not body:
+
+        print(
+            f"WARNING: No recognized announcement text "
+            f"found for {uid}.",
+            file=sys.stderr
+        )
+
+    return body, images
+
+
+def enrich_items(items):
+
+    for index, item in enumerate(items, start=1):
+
+        print(
+            f"Fetching details "
+            f"{index}/{len(items)}: {item['uid']}"
+        )
+
+        body, images = get_detail(
+            item["uid"]
+        )
+
+        item["description_text"] = body
+        item["images"] = images
+
+
+# --------------------------------------------------
+# PREVIOUS FEED / DUPLICATE DETECTION
+# --------------------------------------------------
+
 def previous_ids(feed_path):
-    """Read GUIDs from the previously published RSS feed."""
 
     if not feed_path.exists():
-        print("No previous feed found. Establishing a baseline.")
+
+        print(
+            "No previous feed found. Establishing baseline."
+        )
+
         return None
 
     try:
+
         root = ET.parse(feed_path).getroot()
+
         return {
             guid.text
             for guid in root.findall(".//item/guid")
             if guid.text
         }
+
     except ET.ParseError as exc:
-        sys.exit(f"Previous RSS feed is invalid: {exc}")
+
+        raise RuntimeError(
+            f"Previous RSS feed is invalid: {exc}"
+        )
+
+
+# --------------------------------------------------
+# DISCORD NOTIFICATIONS
+# --------------------------------------------------
+
+def discord_description(item):
+
+    categories = ", ".join(
+        item.get("categories")
+        or [item["category"]]
+    )
+
+    parts = []
+
+    if categories:
+        parts.append(
+            f"**Category:** {categories}"
+        )
+
+    body = item.get("description_text") or ""
+
+    if body:
+        parts.append(body)
+    else:
+        parts.append(
+            "_Announcement text was unavailable "
+            "from the detail API._"
+        )
+
+    return "\n\n".join(parts)[:4000]
 
 
 def send_discord(items):
-    webhook = os.environ.get("DISCORD_WEBHOOK_URL")
+
+    webhook = os.environ.get(
+        "DISCORD_WEBHOOK_URL"
+    )
 
     if not webhook:
-        sys.exit("DISCORD_WEBHOOK_URL secret is missing.")
+        raise RuntimeError(
+            "DISCORD_WEBHOOK_URL secret is missing."
+        )
 
     if not items:
-        print("No new announcements. Discord notification skipped.")
+
+        print(
+            "No new announcements. Discord skipped."
+        )
+
         return
 
-    # Discord accepts up to 10 embeds per webhook message.
-    for start in range(0, len(items), 10):
-        batch = items[start:start + 10]
+    # Keep batches below Discord's combined embed limit.
+    batch = []
+    batch_chars = 0
 
-        embeds = []
+    def send_batch(embeds):
 
-        for item in batch:
-            embeds.append({
-                "title": item["title"][:256],
-                "url": POST_URL.format(uid=item["uid"]),
-                "description": (
-                    f"Category: {item['category']}"
-                    if item["category"]
-                    else "New GrandChase announcement!"
-                ),
-            })
+        if not embeds:
+            return
 
-        payload = json.dumps({"embeds": embeds}).encode("utf-8")
+        payload = json.dumps({
+            "embeds": embeds
+        }).encode("utf-8")
 
         request = urllib.request.Request(
             webhook,
             data=payload,
             headers={
                 "Content-Type": "application/json",
-                "User-Agent": "DiscordBot (https://github.com/zeteheme/gcdcfeed, 1.0)",
+                "User-Agent": USER_AGENT,
             },
             method="POST",
         )
 
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                print(
-                    f"Discord accepted notification: HTTP {response.status}"
-                )
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", "replace")[:300]
-            print(f"Discord rejected notification: HTTP {exc.code} {detail}")
-            sys.exit("Discord notification failed.")
-        except Exception as exc:
-            sys.exit(f"Could not contact Discord: {exc}")
 
-    print(f"Sent {len(items)} new announcement(s) to Discord.")
+            with urllib.request.urlopen(
+                request,
+                timeout=30
+            ) as response:
+
+                print(
+                    "Discord accepted notification: "
+                    f"HTTP {response.status}"
+                )
+
+        except urllib.error.HTTPError as exc:
+
+            detail = exc.read().decode(
+                "utf-8",
+                "replace"
+            )[:500]
+
+            raise RuntimeError(
+                f"Discord rejected notification: "
+                f"HTTP {exc.code} {detail}"
+            )
+
+        except Exception as exc:
+
+            raise RuntimeError(
+                f"Could not contact Discord: {exc}"
+            )
+
+    for item in items:
+
+        categories = (
+            item.get("categories")
+            or [item["category"]]
+        )
+
+        description = discord_description(item)
+
+        category = categories[0]
+
+        embed = {
+            "title": item["title"][:256],
+
+            "url": CATEGORY_URL.format(
+                category=urllib.parse.quote(category)
+            ),
+
+            "description": description,
+
+            "timestamp": item["published"].isoformat(),
+        }
+
+        if item.get("images"):
+
+            embed["image"] = {
+                "url": item["images"][0]
+            }
+
+        embed_size = (
+            len(embed["title"])
+            + len(embed["description"])
+        )
+
+        if (
+            batch
+            and (
+                len(batch) >= 10
+                or batch_chars + embed_size > 5500
+            )
+        ):
+
+            send_batch(batch)
+
+            batch = []
+            batch_chars = 0
+
+        batch.append(embed)
+        batch_chars += embed_size
+
+    send_batch(batch)
+
+    print(
+        f"Sent {len(items)} new announcement(s) to Discord."
+    )
+
+
+# --------------------------------------------------
+# RSS FEED GENERATION
+# --------------------------------------------------
+
+def rss_description(item):
+
+    categories = ", ".join(
+        item.get("categories")
+        or [item["category"]]
+    )
+
+    parts = []
+
+    if categories:
+        parts.append(
+            f"Categories: {categories}"
+        )
+
+    if item.get("description_text"):
+
+        parts.append(
+            item["description_text"]
+        )
+
+    else:
+
+        parts.append(
+            "Announcement text unavailable from the detail API."
+        )
+
+    for image_url in item.get("images") or []:
+
+        parts.append(
+            f"Image: {image_url}"
+        )
+
+    return "\n\n".join(parts)
 
 
 def build_feed(items):
-    last_build = items[0]["published"]
+
+    last_build = (
+        items[0]["published"]
+        if items
+        else datetime.now(timezone.utc)
+    )
 
     lines = [
+
         '<?xml version="1.0" encoding="UTF-8"?>',
+
         '<rss version="2.0">',
+
         "<channel>",
-        f"<title>{text(FEED_TITLE)}</title>",
-        f"<link>{text(SITE_URL)}</link>",
-        f"<description>{text(FEED_DESCRIPTION)}</description>",
+
+        f"<title>{xml_safe(FEED_TITLE)}</title>",
+
+        f"<link>{xml_safe(SITE_URL)}</link>",
+
+        f"<description>{xml_safe(FEED_DESCRIPTION)}</description>",
+
         "<language>en</language>",
+
         "<ttl>60</ttl>",
+
         f"<lastBuildDate>{format_datetime(last_build)}</lastBuildDate>",
+
     ]
 
     for item in items:
-        link = POST_URL.format(uid=item["uid"])
 
-        lines += [
+        categories = (
+            item.get("categories")
+            or [item["category"]]
+        )
+
+        category = categories[0]
+
+        link = CATEGORY_URL.format(
+            category=urllib.parse.quote(category)
+        )
+
+        lines.extend([
+
             "<item>",
-            f"<title>{text(item['title'])}</title>",
-            f"<link>{text(link)}</link>",
-            f'<guid isPermaLink="false">gcm-{item["uid"]}</guid>',
-            f"<pubDate>{format_datetime(item['published'])}</pubDate>",
-        ]
 
-        if item["category"]:
-            lines.append(
-                f"<category>{text(item['category'])}</category>"
-            )
+            f"<title>{xml_safe(item['title'])}</title>",
+
+            f"<link>{xml_safe(link)}</link>",
+
+            f'<guid isPermaLink="false">gcm-{xml_safe(item["uid"])}</guid>',
+
+            f"<pubDate>{format_datetime(item['published'])}</pubDate>",
+
+        ])
+
+        for category_name in categories:
+
+            if category_name:
+
+                lines.append(
+                    f"<category>{xml_safe(category_name)}</category>"
+                )
 
         lines.append(
-            f"<description>Category: {text(item['category'])}</description>"
+            f"<description>{xml_safe(rss_description(item))}</description>"
         )
 
         lines.append("</item>")
 
-    lines += ["</channel>", "</rss>"]
+    lines.extend([
+        "</channel>",
+        "</rss>",
+    ])
 
     return "\n".join(lines) + "\n"
 
 
+# --------------------------------------------------
+# MAIN
+# --------------------------------------------------
+
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+
+    parser = argparse.ArgumentParser(
+        description=__doc__
+    )
 
     parser.add_argument(
         "--input",
-        help="Read a saved API response instead of fetching live data",
+        help="Optional saved API JSON response.",
     )
 
     parser.add_argument(
         "--output",
         default="site/feed.xml",
-        help="Where to write the RSS feed",
+        help="RSS output location.",
     )
 
     args = parser.parse_args()
 
-    if args.input:
-        data = json.loads(
-            Path(args.input).read_text(encoding="utf-8")
+    try:
+
+        if args.input:
+
+            raise RuntimeError(
+                "The multi-category version expects live API "
+                "responses. Remove --input or adapt the input "
+                "loader before using saved JSON."
+            )
+
+        items = collect_all_categories()
+
+        if not items:
+
+            raise RuntimeError(
+                "The APIs returned no posts. "
+                "The previous feed was not changed."
+            )
+
+        print(
+            f"Found {len(items)} unique announcements."
         )
-    else:
-        data = fetch_json(API_URL)
 
-    items = collect_items(data)
+        enrich_items(items)
 
-    if not items:
-        sys.exit("The API returned no posts. Nothing was changed.")
+        output = Path(args.output)
 
-    output = Path(args.output)
+        # Read the previous feed before replacing it.
+        old_ids = previous_ids(output)
 
-    # Read the old feed BEFORE replacing it.
-    old_ids = previous_ids(output)
+        if old_ids is None:
 
-    # First run establishes a baseline without sending old announcements.
-    if old_ids is None:
-        new_items = []
-    else:
-        new_items = [
-            item for item in items
-            if f"gcm-{item['uid']}" not in old_ids
-        ]
+            new_items = []
 
-    print(f"Found {len(items)} GrandChase announcements.")
-    print(f"Found {len(new_items)} new announcement(s).")
+        else:
 
-    # Send notifications before replacing the previous feed.
-    # If Discord fails, GitHub Actions fails and can retry next run.
-    if old_ids is not None:
-        send_discord(new_items)
+            new_items = [
+                item
+                for item in items
+                if f"gcm-{item['uid']}" not in old_ids
+            ]
 
-    output.parent.mkdir(parents=True, exist_ok=True)
+        print(
+            f"Found {len(new_items)} new announcement(s)."
+        )
 
-    output.write_text(
-        build_feed(items),
-        encoding="utf-8",
-    )
+        # Notify Discord before overwriting the previous feed.
+        # If Discord fails, the workflow fails and can retry.
+        if old_ids is not None:
 
-    print(f"Successfully wrote RSS feed to {output}.")
+            send_discord(new_items)
+
+        output.parent.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+        output.write_text(
+            build_feed(items),
+            encoding="utf-8"
+        )
+
+        print(
+            f"Successfully wrote RSS feed to {output}."
+        )
+
+    except Exception as exc:
+
+        sys.exit(str(exc))
 
 
 if __name__ == "__main__":
