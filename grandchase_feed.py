@@ -152,7 +152,10 @@ def send_discord(items):
         request = urllib.request.Request(
             webhook,
             data=payload,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "DiscordBot (https://github.com/zeteheme/gcdcfeed, 1.0)",
+            },
             method="POST",
         )
 
@@ -162,7 +165,8 @@ def send_discord(items):
                     f"Discord accepted notification: HTTP {response.status}"
                 )
         except urllib.error.HTTPError as exc:
-            print(f"Discord rejected notification: HTTP {exc.code}")
+            detail = exc.read().decode("utf-8", "replace")[:300]
+            print(f"Discord rejected notification: HTTP {exc.code} {detail}")
             sys.exit("Discord notification failed.")
         except Exception as exc:
             sys.exit(f"Could not contact Discord: {exc}")
