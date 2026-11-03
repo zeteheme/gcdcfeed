@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 
 """Build the GrandChase RSS feed and notify Discord of new announcements."""
@@ -38,7 +37,7 @@ DETAIL_API = (
 CATEGORIES = ("NEW", "NOTICE", "UPDATE", "EVENT")
 
 ROWS_PER_CATEGORY = 100
-LATEST_PER_CATEGORY = 3
+LATEST_PER_CATEGORY = 10
 
 # Only announcements dated November 1, 2026 or later.
 START_DATE = datetime(
@@ -107,6 +106,15 @@ class ContentParser(HTMLParser):
         self.current_row = []
         self.current_cell = []
 
+        self.link_stack = []
+
+    def newline(self, force=False):
+
+        tail = "".join(self.parts[-3:]).rstrip(" \t\r")
+
+        if force or not tail.endswith("\n"):
+            self.parts.append("\n")
+
     def handle_starttag(self, tag, attrs):
 
         tag = tag.lower()
@@ -142,8 +150,19 @@ class ContentParser(HTMLParser):
             if src:
                 self.images.append(src.strip())
 
+        elif tag == "br" and not self.in_table:
+            self.newline(force=True)
+
+        elif tag == "li" and not self.in_table:
+            self.newline()
+            self.parts.append("• ")
+
+        elif tag == "a" and not self.in_table:
+            href = (attrs.get("href") or "").strip()
+            self.link_stack.append((href, len(self.parts)))
+
         elif tag in self.BLOCK_TAGS and not self.in_table:
-            self.parts.append("\n")
+            self.newline()
 
     def handle_startendtag(self, tag, attrs):
         self.handle_starttag(tag, attrs)
@@ -153,6 +172,9 @@ class ContentParser(HTMLParser):
 
         if self.ignored_depth:
             return
+
+        # Like a browser: a run of spaces/newlines is one space.
+        data = re.sub(r"[ \t\r\n]+", " ", data)
 
         if self.in_table and self.in_cell:
             self.current_cell.append(data)
@@ -210,8 +232,24 @@ class ContentParser(HTMLParser):
             self.in_cell = False
             self.table_rows = []
 
-        elif tag in self.BLOCK_TAGS and not self.in_table:
-            self.parts.append("\n")
+        elif tag == "a" and not self.in_table and self.link_stack:
+
+            href, start = self.link_stack.pop()
+
+            shown = "".join(self.parts[start:])
+
+            if (
+                href.lower().startswith(("http://", "https://"))
+                and href not in shown
+            ):
+                self.parts.append(f" ({href})")
+
+        elif (
+            tag in self.BLOCK_TAGS
+            and tag != "br"
+            and not self.in_table
+        ):
+            self.newline()
 
     @staticmethod
     def clean_cell(value):
@@ -284,9 +322,16 @@ class ContentParser(HTMLParser):
             for line in value.splitlines()
         ]
 
-        return "\n".join(
-            line for line in lines if line
-        )
+        # Keep the post's own spacing, but never more than one
+        # blank line in a row.
+        kept = []
+
+        for line in lines:
+
+            if line or (kept and kept[-1]):
+                kept.append(line)
+
+        return "\n".join(kept).strip()
 
 
 # ============================================================
@@ -456,7 +501,7 @@ def collect_category(data, category):
 
         })
 
-    # Sort newest first, then keep only the latest three.
+    # Sort newest first, then keep the newest few for this category.
     items.sort(
         key=lambda item: item["published"],
         reverse=True
@@ -570,9 +615,16 @@ def get_detail(uid):
 
     if not body:
 
-        raise RuntimeError(
-            f"Announcement {uid} has no readable body. "
-            "Feed generation stopped."
+        # Some posts are only an image (a poster or banner).
+        body = (
+            "(This post is only an image.)"
+            if images
+            else "(This post has no text.)"
+        )
+
+        print(
+            f"Warning: announcement {uid} has no text; "
+            "using a placeholder."
         )
 
     print(
@@ -692,10 +744,7 @@ def split_text(value, limit):
 
 def discord_descriptions(item):
 
-    categories = ", ".join(
-        item.get("categories")
-        or [item["category"]]
-    )
+    categories = item["category"]
 
     prefix = (
         f"**Category:** {categories}\n\n"
@@ -861,29 +910,30 @@ def send_discord(items):
 
 def rss_description(item):
 
-    categories = ", ".join(
-        item.get("categories")
-        or [item["category"]]
-    )
-
     parts = []
 
-    if categories:
+    if item["category"]:
         parts.append(
-            f"Categories: {categories}"
+            "<p><strong>Category:</strong> "
+            f"{html.escape(item['category'])}</p>"
         )
 
-    parts.append(
-        item["description_text"]
-    )
+    for line in item["description_text"].splitlines():
+
+        if line.strip():
+            parts.append(
+                f"<p>{html.escape(line)}</p>"
+            )
 
     for image_url in item.get("images") or []:
 
         parts.append(
-            f"Image: {image_url}"
+            "<p><img src="
+            f"\"{html.escape(image_url, quote=True)}\""
+            " alt=\"\"></p>"
         )
 
-    return "\n\n".join(parts)
+    return "\n".join(parts)
 
 
 # ============================================================
@@ -1043,7 +1093,15 @@ def main():
         if old_ids is not None:
 
             send_discord(
-                new_items
+                sorted(
+                    new_items,
+                    key=lambda item: (
+                        item["published"],
+                        int(item["uid"])
+                        if item["uid"].isdigit()
+                        else 0,
+                    ),
+                )
             )
 
         # 6. Write the RSS feed.
