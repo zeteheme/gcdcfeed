@@ -3,7 +3,9 @@ name: Update GrandChase feed
 
 on:
   schedule:
-    - cron: "0 */12 * * *"
+    # 8:05 AM and 3:05 PM GMT+7, five minutes after the news goes up.
+    # GitHub schedules in UTC: 08:05 GMT+7 = 01:05 UTC, 15:05 GMT+7 = 08:05 UTC.
+    - cron: "5 1,8 * * *"
   workflow_dispatch:
     inputs:
       test_discord:
