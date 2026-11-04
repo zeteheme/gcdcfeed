@@ -37,7 +37,7 @@ DETAIL_API = (
 CATEGORIES = ("NEW", "NOTICE", "UPDATE", "EVENT")
 
 ROWS_PER_CATEGORY = 100
-LATEST_PER_CATEGORY = 10
+LATEST_PER_CATEGORY = 5
 
 # Only announcements dated November 1, 2026 or later.
 START_DATE = datetime(
@@ -454,6 +454,501 @@ def collect_category(data, category):
         if (
             post.get("topFixIsUse")
             and not INCLUDE_PINNED
+        ):
+            continue
+
+        uid = str(
+            post.get("boardUID") or ""
+        ).strip()
+
+        if not uid:
+            continue
+
+        published = parse_time(
+            post.get("displayStartDate")
+            or post.get("lastUpdateDate")
+        )
+
+        # Exclude posts without a valid date.
+        if published is None:
+            continue
+
+        # Exclude announcements before November 1, 2026.
+        if published < START_DATE:
+            continue
+
+        items.append({
+
+            "uid": uid,
+
+            "title": (
+                clean_text(post.get("subject"))
+                or f"Post {uid}"
+            ),
+
+            "category": (
+                clean_text(post.get("categoryName"))
+                or category
+            ),
+
+            "categories": [category],
+
+            "published": published,
+
+            "description_text": "",
+
+            "images": [],
+
+        })
+
+    # Sort newest first, then keep the newest few for this category.
+    items.sort(
+        key=lambda item: item["published"],
+        reverse=True
+    )
+
+    return items[:LATEST_PER_CATEGORY]
+
+
+def collect_all_categories():
+
+    by_uid = {}
+
+    for category in CATEGORIES:
+
+        url = (
+            BASE_API.format(
+                category=category
+            )
+            + f"?pageIndex=1&rows={ROWS_PER_CATEGORY}"
+        )
+
+        print()
+        print("=" * 55)
+        print(f"Fetching category: {category}")
+        print("=" * 55)
+
+        data = fetch_json(url)
+
+        category_posts = collect_category(
+            data,
+            category
+        )
+
+        print(
+            f"Selected {len(category_posts)} "
+            f"latest posts from {category}."
+        )
+
+        for item in category_posts:
+
+            uid = item["uid"]
+
+            if uid in by_uid:
+
+                if category not in by_uid[uid]["categories"]:
+                    by_uid[uid]["categories"].append(
+                        category
+                    )
+
+                continue
+
+            by_uid[uid] = item
+
+    items = list(by_uid.values())
+
+    items.sort(
+        key=lambda item: item["published"],
+        reverse=True
+    )
+
+    return items
+
+
+# ============================================================
+# FETCH FULL ANNOUNCEMENT DETAILS
+# ============================================================
+
+def get_detail(uid):
+
+    url = DETAIL_API.format(
+        uid=urllib.parse.quote(
+            str(uid),
+            safe=""
+        )
+    )
+
+    print(
+        f"Fetching announcement body: {uid}"
+    )
+
+    data = fetch_json(url)
+
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            f"Unexpected detail response for {uid}."
+        )
+
+    # Confirmed GrandChase API fields.
+    raw_html = data.get("detailHTML") or ""
+    raw_text = data.get("detailTEXT") or ""
+
+    parser = ContentParser()
+
+    if raw_html:
+
+        parser.feed(raw_html)
+        parser.close()
+
+    body = (
+        parser.plain_text()
+        or clean_text(raw_text)
+    )
+
+    images = list(dict.fromkeys(
+        urljoin(
+            "https://grandchase.net/",
+            image_url
+        )
+        for image_url in parser.images
+    ))
+
+    if not body:
+
+        # Some posts are only an image (a poster or banner).
+        body = (
+            "(This post is only an image.)"
+            if images
+            else "(This post has no text.)"
+        )
+
+        print(
+            f"Warning: announcement {uid} has no text; "
+            "using a placeholder."
+        )
+
+    print(
+        f"Retrieved {len(body)} characters "
+        f"and {len(images)} images."
+    )
+
+    return body, images
+
+
+def enrich_items(items):
+
+    print()
+    print("=" * 55)
+    print("FETCHING ANNOUNCEMENT CONTENT")
+    print("=" * 55)
+
+    for index, item in enumerate(
+        items,
+        start=1
+    ):
+
+        print(
+            f"[{index}/{len(items)}] "
+            f"{item['title']}"
+        )
+
+        body, images = get_detail(
+            item["uid"]
+        )
+
+        item["description_text"] = body
+        item["images"] = images
+
+    print()
+    print(
+        f"Successfully retrieved all {len(items)} bodies."
+    )
+
+
+# ============================================================
+# PREVIOUS FEED / DUPLICATE DETECTION
+# ============================================================
+
+def previous_ids(feed_path):
+
+    if not feed_path.exists():
+
+        print(
+            "No previous feed found. Establishing baseline."
+        )
+
+        return None
+
+    try:
+
+        root = ET.parse(
+            feed_path
+        ).getroot()
+
+        return {
+            guid.text
+            for guid in root.findall(".//item/guid")
+            if guid.text
+        }
+
+    except ET.ParseError as exc:
+
+        raise RuntimeError(
+            f"Previous RSS feed is invalid: {exc}"
+        )
+
+
+# ============================================================
+# DISCORD MESSAGE CHUNKING
+# ============================================================
+
+def split_text(value, limit):
+
+    value = str(value or "")
+
+    if not value:
+        return [""]
+
+    chunks = []
+
+    while len(value) > limit:
+
+        split_at = value.rfind(
+            "\n",
+            0,
+            limit
+        )
+
+        if split_at < limit // 2:
+
+            split_at = value.rfind(
+                " ",
+                0,
+                limit
+            )
+
+        if split_at < limit // 2:
+            split_at = limit
+
+        chunks.append(
+            value[:split_at].strip()
+        )
+
+        value = value[split_at:].strip()
+
+    if value:
+        chunks.append(value)
+
+    return chunks
+
+
+def discord_descriptions(item):
+
+    categories = item["category"]
+
+    prefix = (
+        f"**Category:** {categories}\n\n"
+    )
+
+    body = item["description_text"]
+
+    available = (
+        DISCORD_DESCRIPTION_LIMIT
+        - len(prefix)
+    )
+
+    chunks = split_text(
+        body,
+        available
+    )
+
+    return [
+        prefix + chunk
+        for chunk in chunks
+    ]
+
+
+# ============================================================
+# DISCORD NOTIFICATIONS
+# ============================================================
+
+def send_discord(items):
+
+    webhook = os.environ.get(
+        "DISCORD_WEBHOOK_URL"
+    )
+
+    if not webhook:
+
+        raise RuntimeError(
+            "DISCORD_WEBHOOK_URL secret is missing."
+        )
+
+    if not items:
+
+        print(
+            "No new announcements. Discord skipped."
+        )
+
+        return
+
+    sent = 0
+
+    for item in items:
+
+        categories = (
+            item.get("categories")
+            or [item["category"]]
+        )
+
+        category = categories[0]
+
+        descriptions = discord_descriptions(
+            item
+        )
+
+        print()
+        print(
+            f"Sending: {item['title']}"
+        )
+
+        for index, description in enumerate(
+            descriptions,
+            start=1
+        ):
+
+            title = item["title"]
+
+            if len(descriptions) > 1:
+
+                title = (
+                    f"{title} "
+                    f"({index}/{len(descriptions)})"
+                )
+
+            embed = {
+
+                "title": title[:256],
+
+                "url": category_link(category),
+
+                "description": description,
+
+                "timestamp": item[
+                    "published"
+                ].isoformat(),
+
+            }
+
+            if (
+                index == 1
+                and item.get("images")
+            ):
+
+                embed["image"] = {
+                    "url": item["images"][0]
+                }
+
+            payload = json.dumps({
+                "embeds": [embed]
+            }).encode("utf-8")
+
+            request = urllib.request.Request(
+                webhook,
+                data=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": USER_AGENT,
+                },
+                method="POST",
+            )
+
+            try:
+
+                with urllib.request.urlopen(
+                    request,
+                    timeout=30
+                ) as response:
+
+                    print(
+                        f"Discord accepted message: "
+                        f"HTTP {response.status}"
+                    )
+
+            except urllib.error.HTTPError as exc:
+
+                detail = exc.read().decode(
+                    "utf-8",
+                    "replace"
+                )[:500]
+
+                raise RuntimeError(
+                    f"Discord rejected notification: "
+                    f"HTTP {exc.code}: {detail}"
+                )
+
+            except Exception as exc:
+
+                raise RuntimeError(
+                    f"Could not contact Discord: {exc}"
+                )
+
+            sent += 1
+
+            time.sleep(0.5)
+
+    print()
+    print(
+        f"Sent {sent} Discord message(s) "
+        f"for {len(items)} new announcement(s)."
+    )
+
+
+# ============================================================
+# RSS DESCRIPTION
+# ============================================================
+
+def rss_description(item):
+
+    parts = []
+
+    if item["category"]:
+        parts.append(
+            "<p><strong>Category:</strong> "
+            f"{html.escape(item['category'])}</p>"
+        )
+
+    for line in item["description_text"].splitlines():
+
+        if line.strip():
+            parts.append(
+                f"<p>{html.escape(line)}</p>"
+            )
+
+    for image_url in item.get("images") or []:
+
+        parts.append(
+            "<p><img src="
+            f"\"{html.escape(image_url, quote=True)}\""
+            " alt=\"\"></p>"
+        )
+
+    return "\n".join(parts)
+
+
+# ============================================================
+# BUILD RSS FEED
+# ============================================================
+
+def build_feed(items):
+
+    last_build = (
+        items[0]["published"]
+        if items
+        else datetime.now(timezone.utc)
+    )
+
+ and not INCLUDE_PINNED
         ):
             continue
 
