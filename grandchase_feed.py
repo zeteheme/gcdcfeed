@@ -219,13 +219,13 @@ class ContentParser(HTMLParser):
 
         elif tag == "table" and self.in_table:
 
-            markdown_table = self.convert_table(
+            table_text = self.convert_table(
                 self.table_rows
             )
 
-            if markdown_table:
+            if table_text:
                 self.parts.append(
-                    "\n" + markdown_table + "\n"
+                    "\n\n" + table_text + "\n\n"
                 )
 
             self.in_table = False
@@ -259,57 +259,35 @@ class ContentParser(HTMLParser):
             str(value or "")
         ).strip()
 
-        # Escape Markdown table separators.
-        value = value.replace("|", r"\|")
-
         return value
 
     @classmethod
     def convert_table(cls, rows):
 
-        if not rows:
-            return ""
-
+        # Discord does not draw Markdown tables, so each row becomes
+        # one line, with the cells separated by " · ".
         rows = [
             [cls.clean_cell(cell) for cell in row]
             for row in rows
         ]
 
         rows = [
-            row for row in rows
-            if any(row)
+            [cell for cell in row if cell]
+            for row in rows
         ]
+
+        rows = [row for row in rows if row]
 
         if not rows:
             return ""
 
-        # Make every row have the same number of columns.
-        column_count = max(
-            len(row) for row in rows
-        )
+        lines = [" · ".join(row) for row in rows]
 
-        rows = [
-            row + [""] * (column_count - len(row))
-            for row in rows
-        ]
+        # The first row is the table's title or header.
+        if len(lines) > 1:
+            lines[0] = f"**{lines[0]}**"
 
-        # First row becomes the Markdown header.
-        header = rows[0]
-
-        markdown = [
-            "| " + " | ".join(header) + " |",
-            "| " + " | ".join(
-                ["---"] * column_count
-            ) + " |",
-        ]
-
-        for row in rows[1:]:
-
-            markdown.append(
-                "| " + " | ".join(row) + " |"
-            )
-
-        return "\n".join(markdown)
+        return "\n".join(lines)
 
     def plain_text(self):
 
@@ -769,6 +747,184 @@ def discord_descriptions(item):
 
 
 # ============================================================
+# DISCORD IMAGE UPLOADS
+# ============================================================
+
+# Some image servers refuse to let Discord load pictures from a web
+# address, so the pictures are downloaded here and uploaded directly.
+DISCORD_MAX_IMAGES = 4
+
+MAX_UPLOAD_BYTES = 8 * 1024 * 1024
+
+
+def image_kind(data):
+
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png", ".png"
+
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg", ".jpg"
+
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif", ".gif"
+
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp", ".webp"
+
+    return None
+
+
+def download_images(urls, referer="https://grandchase.net/"):
+
+    files = []
+
+    budget = MAX_UPLOAD_BYTES
+
+    for url in urls:
+
+        if len(files) >= DISCORD_MAX_IMAGES:
+            break
+
+        if not url.lower().startswith(("http://", "https://")):
+            continue
+
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Referer": referer,
+                "Accept": "image/*",
+            },
+        )
+
+        try:
+
+            with urllib.request.urlopen(
+                request,
+                timeout=30
+            ) as response:
+
+                data = response.read(budget + 1)
+
+        except Exception as exc:
+
+            print(f"Could not download image {url}: {exc}")
+
+            continue
+
+        kind = image_kind(data)
+
+        if kind is None or len(data) > budget:
+
+            print(
+                f"Skipping image {url}: "
+                "not a usable picture, or too large."
+            )
+
+            continue
+
+        budget -= len(data)
+
+        content_type, extension = kind
+
+        files.append((
+            f"image{len(files) + 1}{extension}",
+            content_type,
+            data,
+        ))
+
+    return files
+
+
+def discord_request(webhook, embeds, files=None):
+
+    payload = json.dumps({
+        "embeds": embeds,
+        "allowed_mentions": {"parse": []},
+    })
+
+    if not files:
+
+        body = payload.encode("utf-8")
+
+        content_type = "application/json"
+
+    else:
+
+        boundary = "----grandchase" + os.urandom(8).hex()
+
+        body = bytearray()
+
+        body += (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; '
+            'name="payload_json"\r\n'
+            "Content-Type: application/json\r\n\r\n"
+        ).encode("utf-8")
+
+        body += payload.encode("utf-8") + b"\r\n"
+
+        for index, (name, file_type, data) in enumerate(files):
+
+            body += (
+                f"--{boundary}\r\n"
+                'Content-Disposition: form-data; '
+                f'name="files[{index}]"; filename="{name}"\r\n'
+                f"Content-Type: {file_type}\r\n\r\n"
+            ).encode("utf-8")
+
+            body += data + b"\r\n"
+
+        body += f"--{boundary}--\r\n".encode("utf-8")
+
+        body = bytes(body)
+
+        content_type = (
+            f"multipart/form-data; boundary={boundary}"
+        )
+
+    request = urllib.request.Request(
+        webhook,
+        data=body,
+        headers={
+            "Content-Type": content_type,
+            "User-Agent": USER_AGENT,
+        },
+        method="POST",
+    )
+
+    try:
+
+        with urllib.request.urlopen(
+            request,
+            timeout=60
+        ) as response:
+
+            print(
+                f"Discord accepted message: "
+                f"HTTP {response.status}"
+            )
+
+    except urllib.error.HTTPError as exc:
+
+        detail = exc.read().decode(
+            "utf-8",
+            "replace"
+        )[:500]
+
+        raise RuntimeError(
+            f"Discord rejected notification: "
+            f"HTTP {exc.code}: {detail}"
+        )
+
+    except Exception as exc:
+
+        raise RuntimeError(
+            f"Could not contact Discord: {exc}"
+        )
+
+
+# ============================================================
 # DISCORD NOTIFICATIONS
 # ============================================================
 
@@ -840,58 +996,57 @@ def send_discord(items):
 
             }
 
-            if (
-                index == 1
-                and item.get("images")
-            ):
+            embeds = [embed]
+
+            files = []
+
+            if index == 1 and item.get("images"):
+
+                files = download_images(item["images"])
+
+                if files:
+
+                    embed["image"] = {
+                        "url": f"attachment://{files[0][0]}"
+                    }
+
+                    # Embeds that share a web address are shown
+                    # together as one picture grid (up to four).
+                    for name, _, _ in files[1:]:
+
+                        embeds.append({
+                            "url": embed["url"],
+                            "image": {
+                                "url": f"attachment://{name}"
+                            },
+                        })
+
+                else:
+
+                    # Let Discord try to load the first picture itself.
+                    embed["image"] = {
+                        "url": item["images"][0]
+                    }
+
+            try:
+
+                discord_request(webhook, embeds, files)
+
+            except RuntimeError as exc:
+
+                if not files:
+                    raise
+
+                print(
+                    "Retrying without uploaded images "
+                    f"({exc})."
+                )
 
                 embed["image"] = {
                     "url": item["images"][0]
                 }
 
-            payload = json.dumps({
-                "embeds": [embed]
-            }).encode("utf-8")
-
-            request = urllib.request.Request(
-                webhook,
-                data=payload,
-                headers={
-                    "Content-Type": "application/json",
-                    "User-Agent": USER_AGENT,
-                },
-                method="POST",
-            )
-
-            try:
-
-                with urllib.request.urlopen(
-                    request,
-                    timeout=30
-                ) as response:
-
-                    print(
-                        f"Discord accepted message: "
-                        f"HTTP {response.status}"
-                    )
-
-            except urllib.error.HTTPError as exc:
-
-                detail = exc.read().decode(
-                    "utf-8",
-                    "replace"
-                )[:500]
-
-                raise RuntimeError(
-                    f"Discord rejected notification: "
-                    f"HTTP {exc.code}: {detail}"
-                )
-
-            except Exception as exc:
-
-                raise RuntimeError(
-                    f"Could not contact Discord: {exc}"
-                )
+                discord_request(webhook, [embed], None)
 
             sent += 1
 
@@ -921,8 +1076,15 @@ def rss_description(item):
     for line in item["description_text"].splitlines():
 
         if line.strip():
+
+            safe_line = re.sub(
+                r"\*\*(.+?)\*\*",
+                r"<strong>\1</strong>",
+                html.escape(line)
+            )
+
             parts.append(
-                f"<p>{html.escape(line)}</p>"
+                f"<p>{safe_line}</p>"
             )
 
     for image_url in item.get("images") or []:
